@@ -13,6 +13,13 @@ def init_db(engine) -> None:
 
     Base.metadata.create_all(bind=engine)
 
+    from sqlalchemy import text
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE job_applications ADD COLUMN gmail_thread_id VARCHAR"))
+    except Exception:
+        pass
+
 
 def get_or_create_user_by_chat_id(db: Session, telegram_chat_id: str) -> User:
     stmt = select(User).where(User.telegram_chat_id == telegram_chat_id)

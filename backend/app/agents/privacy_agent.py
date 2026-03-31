@@ -151,7 +151,8 @@ class IngestionPipeline:
                         "subject": gmail_message.subject,
                         "from": gmail_message.from_address,
                         "date": gmail_message.date,
-                        "body": gmail_message.body_text[:600] # Compressed snippet for Gemma TPM Limits
+                        "body": gmail_message.body_text[:600],  # Compressed snippet for Gemma TPM Limits
+                        "full_body": gmail_message.body_text,   # Full body for memory recall
                     })
                 except Exception as e:
                     logger.error(f"Failed to fetch message {msg_id}: {e}")
@@ -195,7 +196,8 @@ class IngestionPipeline:
                 try:
                     # Redaction & Privacy
                     detected_secrets = res.get("secrets", [])
-                    redacted_text = item["body"]
+                    full_text = item.get("full_body") or item["body"]
+                    redacted_text = full_text
                     if detected_secrets:
                         secrets_alerted += 1
                         for s in detected_secrets:

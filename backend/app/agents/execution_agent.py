@@ -102,14 +102,23 @@ class ExecutionAgent:
                 await self._send_telegram(chat_id, f"✅ Done! {total_done} messages processed. Your inbox is cleaner now.")
                 return
 
-        # 2. Parse Intent
+        # 2. Parse Intent — The AI Brain must know EVERY available action
         
         prompt = (
-            "You are the NextRole AI Agent. Parse the user's message and determine the action.\n"
-            "ACTIONS:\n"
-            "- 'scan_inbox': Refresh/scan mail. Params: {'limit': int}. Use limit 500 if they say 'FULL SCAN' or 'WHOLE'.\n"
-            "- 'show_updates': Query job status or email history.\n"
-            "- 'unknown': Natural chat.\n\n"
+            "You are the NextRole AI Agent. Parse the user's message and determine the BEST action.\n"
+            "Return JSON: {\"action\": \"string\", \"params\": {}}\n\n"
+            "AVAILABLE ACTIONS (pick the most specific one):\n"
+            "- 'scan_inbox': User wants to scan/refresh/ingest their inbox emails. Params: {'limit': int}. Use limit 500 for 'FULL SCAN'.\n"
+            "- 'show_updates': User asks about job application status, specific emails, or email history.\n"
+            "- 'delete_spam': User wants to DELETE or REMOVE spam emails. Params: {'days': int or null for all}.\n"
+            "- 'delete_promotions': User wants to DELETE promotions, newsletters, or marketing junk. Params: {'days': int or null for all}.\n"
+            "- 'archive_marketing': User wants to ARCHIVE (not delete) newsletters or marketing emails. Params: {'days': int}.\n"
+            "- 'count_spam': User wants to KNOW HOW MANY spam emails they have, without deleting.\n"
+            "- 'connect_gmail': User wants to connect or link their Gmail account.\n"
+            "- 'unknown': General conversation, questions, or anything that doesn't fit above.\n\n"
+            "IMPORTANT: If the user says 'delete spam', 'remove spam', 'clean spam' → use 'delete_spam', NOT 'scan_inbox'.\n"
+            "If the user says 'delete promotions', 'delete newsletters', 'remove marketing' → use 'delete_promotions'.\n"
+            "If the user says 'how much spam', 'count spam', 'check spam' → use 'count_spam', NOT 'scan_inbox'.\n\n"
             f"User Message: {text}"
         )
 
@@ -118,10 +127,15 @@ class ExecutionAgent:
         params = intent.get("params", {}) or {}
 
         if action == "scan_inbox":
-            incomplete = get_incomplete_scan_task(db, user.id)
             scan_limit = params.get("limit") or 20
             if "full scan" in text.lower() or "whole" in text.lower():
                 scan_limit = 500
+
+            # Only resume old tasks if user EXPLICITLY asks to continue/resume
+            text_lower = text.lower()
+            wants_resume = any(kw in text_lower for kw in ["continue", "resume", "pick up", "where i left", "complete the old"])
+            
+            incomplete = get_incomplete_scan_task(db, user.id) if wants_resume else None
 
             if incomplete:
                 await self._send_telegram(
@@ -132,6 +146,12 @@ class ExecutionAgent:
                 scan_id = incomplete.id
                 scan_limit = incomplete.scan_limit
             else:
+                # Mark any old incomplete tasks as failed before starting fresh
+                old_task = get_incomplete_scan_task(db, user.id)
+                if old_task:
+                    from app.memory.relational.repository import fail_scan_task
+                    fail_scan_task(db, old_task.id)
+
                 if scan_limit >= 500:
                     await self._send_telegram(chat_id, f"🚀 Initiating a **FULL SCAN** of your last {scan_limit} emails. This will be deep and thorough...")
                 else:
@@ -163,7 +183,7 @@ class ExecutionAgent:
             
             # Agentic Proactive Reasoning
             report_prompt = (
-                f"Generate a scan summary for {username}. \n"
+                f"Generate a scan summary for the user. \n"
                 f"Scan Results: {total_processed} new emails ingested.\n"
                 f"Observations: {len(all_observations['spam'])} spam, {len(all_observations['newsletter'])} newsletters.\n"
                 "Task: Write a professional, friendly briefing. If there is spam or newsletters, "
@@ -203,8 +223,8 @@ class ExecutionAgent:
                 "Provide a natural, helpful response to the user. "
                 "If they asked about a specific company, focus on that."
             )
-            # Use core model for final synthesis
-            response_text = await self.ai.generate_text(summary_prompt, model_type="core")
+            # Use lite model for final synthesis
+            response_text = await self.ai.generate_text(summary_prompt, model_type="lite")
             await self._send_telegram(chat_id, response_text)
             return
 
@@ -225,21 +245,61 @@ class ExecutionAgent:
             await self._send_telegram(chat_id, f"Archived {processed} marketing emails from the last {days} day(s).")
             return
 
-        if action == "delete_spam":
-            days = params.get("days") or 1
+        if action == "delete_promotions":
+            days = params.get("days")
             accounts = list(db.execute(select(GmailAccount).where(GmailAccount.user_id == user.id)).scalars().all())
             processed = 0
             for acc in accounts:
                 service = gmail_client.build_service_from_refresh_token(refresh_token_encrypted=acc.oauth_refresh_token_encrypted)
+                # Search Gmail's Promotions category + newsletters
+                query = f"newer_than:{days}d category:promotions" if days else "category:promotions"
+                ids = gmail_client.list_messages(service=service, query=query, max_results=500)
+                for m in ids:
+                    gmail_client.trash_message(service=service, message_id=m["message_id"])
+                    processed += 1
+                # Also catch newsletter-labeled ones
+                query2 = f"newer_than:{days}d label:Newsletter" if days else "label:Newsletter"
+                ids2 = gmail_client.list_messages(service=service, query=query2, max_results=500)
+                for m in ids2:
+                    gmail_client.trash_message(service=service, message_id=m["message_id"])
+                    processed += 1
+            await self._send_telegram(chat_id, f"🗑️ Done! Trashed {processed} promotional/newsletter email(s). Your inbox is squeaky clean!")
+            return
+
+        if action == "delete_spam":
+            days = params.get("days")
+            accounts = list(db.execute(select(GmailAccount).where(GmailAccount.user_id == user.id)).scalars().all())
+            processed = 0
+            for acc in accounts:
+                service = gmail_client.build_service_from_refresh_token(refresh_token_encrypted=acc.oauth_refresh_token_encrypted)
+                # If days specified, filter by date. Otherwise, get ALL spam.
+                query = f"newer_than:{days}d in:spam" if days else "in:spam"
                 ids = gmail_client.list_messages(
                     service=service,
-                    query=f"newer_than:{days}d label:Spam",
-                    max_results=100,
+                    query=query,
+                    max_results=500,
                 )
                 for m in ids:
                     gmail_client.trash_message(service=service, message_id=m["message_id"])
                     processed += 1
-            await self._send_telegram(chat_id, f"Moved {processed} spam emails from the last {days} day(s) to Trash.")
+            await self._send_telegram(chat_id, f"🗑️ Done! Permanently trashed {processed} spam email(s). Your inbox is cleaner now.")
+            return
+
+        if action == "count_spam":
+            accounts = list(db.execute(select(GmailAccount).where(GmailAccount.user_id == user.id)).scalars().all())
+            total_spam = 0
+            for acc in accounts:
+                service = gmail_client.build_service_from_refresh_token(refresh_token_encrypted=acc.oauth_refresh_token_encrypted)
+                ids = gmail_client.list_messages(
+                    service=service,
+                    query="in:spam",
+                    max_results=500,
+                )
+                total_spam += len(ids)
+            if total_spam == 0:
+                await self._send_telegram(chat_id, "✨ Your spam folder is completely clean! Zero spam emails found.")
+            else:
+                await self._send_telegram(chat_id, f"📊 You currently have **{total_spam}** spam email(s) in your spam folder. Want me to delete them all?")
             return
 
         # DEFAULT: Natural Chatting Engagement & Long-Term Memory

@@ -125,30 +125,16 @@ class GmailClient:
             .execute()
         )
         messages = result.get("messages", []) or []
-        # list() doesn't include threadId. Fetch metadata per message.
+        # list() directly provides 'id' and 'threadId'. Extract them avoiding O(N) HTTP calls.
         out: List[Dict[str, str]] = []
         for m in messages:
             mid = m.get("id")
             if not mid:
                 continue
-            try:
-                meta = (
-                    service.users()
-                    .messages()
-                    .get(userId="me", id=mid, format="metadata", metadataHeaders=["Thread-Id", "From", "To", "Subject", "Date"])
-                    .execute()
-                )
-                headers = {h["name"].lower(): h.get("value", "") for h in meta.get("payload", {}).get("headers", [])}
-                out.append(
-                    {
-                        "message_id": mid,
-                        "thread_id": meta.get("threadId") or headers.get("thread-id") or "",
-                    }
-                )
-            except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning(f"Failed to fetch metadata for message {mid}: {e}")
-                continue
+            out.append({
+                "message_id": mid,
+                "thread_id": m.get("threadId") or "",
+            })
         return out
 
     def get_message(self, *, service, message_id: str) -> GmailMessage:
