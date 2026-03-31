@@ -54,6 +54,7 @@ class JobApplication(Base):
     last_status_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     source_message_id = Column(String, index=True, nullable=True)
+    gmail_thread_id = Column(String, index=True, nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
@@ -81,6 +82,47 @@ class PrivacyFlag(Base):
     gmail_message_id = Column(String, index=True, nullable=False)
     detected_secret_type = Column(String, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class PendingAction(Base):
+    __tablename__ = "pending_actions"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    
+    # trash, archive, mark_read, etc.
+    action_type = Column(String, index=True, nullable=False)
+    description = Column(Text, nullable=False)
+    
+    # Store the actual Gmail Message/Thread IDs to act on
+    message_ids = Column(SQLiteJSON, nullable=False)
+    
+    # pending, completed, declined
+    status = Column(String, index=True, nullable=False, default="pending")
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class ScanTask(Base):
+    __tablename__ = "scan_tasks"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    
+    # full_scan, initial_sync, etc.
+    task_type = Column(String, index=True, nullable=False)
+    
+    scan_limit = Column(Integer, nullable=False, default=20)
+    processed_count = Column(Integer, nullable=False, default=0)
+    
+    # running, failed, completed
+    status = Column(String, index=True, nullable=False, default="running")
+    
+    # Track exactly where we stopped
+    last_message_id = Column(String, nullable=True)
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
 
 def _utcnow():

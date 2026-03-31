@@ -1,10 +1,10 @@
 import datetime as dt
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select
 from sqlalchemy.orm import Session
+from sqlalchemy import delete, select, update
 
-from app.memory.relational.models import EmailEvent, GmailAccount, JobApplication, PrivacyFlag, Thread, User
+from app.memory.relational.models import EmailEvent, GmailAccount, JobApplication, PendingAction, PrivacyFlag, ScanTask, Thread, User
 
 
 def init_db(engine) -> None:
@@ -66,17 +66,19 @@ def create_job_application(
     user_id: int,
     company: str,
     role: Optional[str],
-    applied_at: Optional[dt.datetime],
-    source_message_id: Optional[str],
+    applied_at: Optional[dt.datetime] = None,
+    source_message_id: Optional[str] = None,
+    gmail_thread_id: Optional[str] = None,
 ) -> JobApplication:
     job = JobApplication(
         user_id=user_id,
         company=company,
         role=role,
-        applied_at=applied_at,
+        applied_at=applied_at or dt.datetime.now(dt.timezone.utc),
         status="Applied",
-        last_status_at=dt.datetime.now(dt.timezone.utc),
+        last_status_at=applied_at or dt.datetime.now(dt.timezone.utc),
         source_message_id=source_message_id,
+        gmail_thread_id=gmail_thread_id,
     )
     db.add(job)
     db.commit()
@@ -94,14 +96,14 @@ def list_job_applications(db: Session, user_id: int, limit: int = 200) -> List[J
     return list(db.execute(stmt).scalars().all())
 
 
-def update_job_status(db: Session, job_id: int, new_status: str, *, source_message_id: Optional[str] = None) -> JobApplication:
+def update_job_status(db: Session, job_id: int, new_status: str, *, source_message_id: Optional[str] = None, last_status_at: Optional[dt.datetime] = None) -> JobApplication:
     job = db.execute(select(JobApplication).where(JobApplication.id == job_id)).scalars().first()
     # If not found, create logic can be added later; for now we fail clearly.
     if job is None:
         raise ValueError(f"JobApplication not found: {job_id}")
 
     job.status = new_status
-    job.last_status_at = dt.datetime.now(dt.timezone.utc)
+    job.last_status_at = last_status_at or dt.datetime.now(dt.timezone.utc)
     if source_message_id:
         job.source_message_id = source_message_id
     db.add(job)
@@ -142,3 +144,70 @@ def record_privacy_flag(db: Session, user_id: int, gmail_message_id: str, detect
     db.refresh(flag)
     return flag
 
+def create_pending_action(db: Session, user_id: int, action_type: str, description: str, message_ids: List[str]) -> PendingAction:
+    # Clear old pending actions for this user to keep 'Last Proposal' focused
+    db.execute(delete(PendingAction).where(PendingAction.user_id == user_id, PendingAction.status == "pending"))
+    
+    action = PendingAction(user_id=user_id, action_type=action_type, description=description, message_ids=message_ids)
+    db.add(action)
+    db.commit()
+    db.refresh(action)
+    return action
+
+
+def get_latest_pending_action(db: Session, user_id: int) -> Optional[PendingAction]:
+    stmt = select(PendingAction).where(PendingAction.user_id == user_id, PendingAction.status == "pending").order_by(PendingAction.created_at.desc())
+    return db.execute(stmt).scalars().first()
+
+
+def update_pending_action_status(db: Session, action_id: int, status: str) -> Optional[PendingAction]:
+    action = db.execute(select(PendingAction).where(PendingAction.id == action_id)).scalars().first()
+    if action:
+        action.status = status
+        db.add(action)
+        db.commit()
+        db.refresh(action)
+    return action
+
+
+def get_incomplete_scan_task(db: Session, user_id: int) -> Optional[ScanTask]:
+    stmt = (
+        select(ScanTask)
+        .where(ScanTask.user_id == user_id, ScanTask.status.in_(["running", "failed"]))
+        .order_by(ScanTask.created_at.desc())
+        .limit(1)
+    )
+    return db.execute(stmt).scalars().first()
+
+
+def start_scan_task(db: Session, user_id: int, task_type: str, scan_limit: int) -> ScanTask:
+    # Fail any existing running ones to be clean
+    db.execute(
+        update(ScanTask)
+        .where(ScanTask.user_id == user_id, ScanTask.status == "running")
+        .values(status="failed")
+    )
+    task = ScanTask(user_id=user_id, task_type=task_type, scan_limit=scan_limit, status="running")
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+def update_scan_progress(db: Session, task_id: int, processed_count: int, last_message_id: str) -> None:
+    db.execute(
+        update(ScanTask)
+        .where(ScanTask.id == task_id)
+        .values(processed_count=processed_count, last_message_id=last_message_id)
+    )
+    db.commit()
+
+
+def complete_scan_task(db: Session, task_id: int) -> None:
+    db.execute(update(ScanTask).where(ScanTask.id == task_id).values(status="completed"))
+    db.commit()
+
+
+def fail_scan_task(db: Session, task_id: int) -> None:
+    db.execute(update(ScanTask).where(ScanTask.id == task_id).values(status="failed"))
+    db.commit()

@@ -37,18 +37,19 @@ class ClassifierAgent:
         from_address: str,
         message_id: str,
         thread_id: str,
+        ai_result: Optional[dict] = None,
     ) -> dict:
-        """
-        Use LLM to categorize the email.
-        """
-        prompt = (
-            "Categorize this email into exactly one of these labels: 'Job Application', 'Newsletter', 'Marketing', 'Spam', 'Personal'.\n"
-            "Also decide if we should archive it (Newsletter/Marketing) or move to trash (Spam).\n"
-            "Return JSON: {\"label\": \"string\", \"apply_labels\": bool, \"add_label_names\": [\"string\"], \"remove_label_names\": [\"string\"]}.\n\n"
-            f"Subject: {subject}\nFrom: {from_address}\nBody: {text[:1000]}"
-        )
-        # Use gemma for fast classification
-        result = await self.ai.generate_json(prompt, model_type="gemma")
+        if ai_result:
+            result = ai_result
+        else:
+            prompt = (
+                "Categorize this email into exactly one of these labels: 'Job Application', 'Newsletter', 'Marketing', 'Spam', 'Personal'.\n"
+                "Also decide if we should archive it (Newsletter/Marketing) or move to trash (Spam).\n"
+                "Return JSON: {\"label\": \"string\", \"apply_labels\": bool, \"add_label_names\": [\"string\"], \"remove_label_names\": [\"string\"]}.\n\n"
+                f"Subject: {subject}\nFrom: {from_address}\nBody: {text[:1000]}"
+            )
+            # Use gemma for fast classification
+            result = await self.ai.generate_json(prompt, model_type="gemma")
         
         # Ensure 'label' maps to CATEGORY_LABELS or default
         label = result.get("label", "Personal")

@@ -10,10 +10,17 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.gmail.client import GmailClient
 from app.memory.relational.models import GmailAccount, JobApplication
-from app.memory.relational.repository import get_or_create_user_by_chat_id
-
-
 from app.core.dependencies import get_ai_client, get_chroma_client
+from app.agents.privacy_agent import IngestionPipeline
+from app.memory.vector.chroma_client import ChromaClient
+from app.memory.relational.repository import (
+    get_or_create_user_by_chat_id, 
+    get_latest_pending_action, 
+    update_pending_action_status,
+    create_pending_action,
+    get_incomplete_scan_task,
+    start_scan_task,
+)
 
 import logging
 logger = logging.getLogger(__name__)
@@ -71,60 +78,107 @@ class ExecutionAgent:
             )
             return
 
+        # 1. Handle Proactive Confirmations ("Yes", "Do it")
+        if text.lower() in ["yes", "confirm", "do it", "sure", "ok", "okay", "go ahead"]:
+            pending = get_latest_pending_action(db, user.id)
+            if pending:
+                await self._send_telegram(chat_id, f"⚡ Executing: {pending.description}...")
+                accounts = list(db.execute(select(GmailAccount).where(GmailAccount.user_id == user.id)).scalars().all())
+                
+                total_done = 0
+                for acc in accounts:
+                    service = gmail_client.build_service_from_refresh_token(refresh_token_encrypted=acc.oauth_refresh_token_encrypted)
+                    if pending.action_type == "trash":
+                        # Applying both TRASH and removing INBOX in one batch call
+                        gmail_client.batch_modify_labels(service=service, message_ids=pending.message_ids, add_label_ids=["TRASH"], remove_label_ids=["INBOX"])
+                        # SYNC: Forget the junk in AI Memory too
+                        chroma.delete_message_summaries(user_id=user.id, message_ids=pending.message_ids)
+                    elif pending.action_type == "archive":
+                        gmail_client.batch_modify_labels(service=service, message_ids=pending.message_ids, remove_label_ids=["INBOX"])
+                    total_done += len(pending.message_ids)
+
+                
+                update_pending_action_status(db, pending.id, "completed")
+                await self._send_telegram(chat_id, f"✅ Done! {total_done} messages processed. Your inbox is cleaner now.")
+                return
+
+        # 2. Parse Intent
+        
         prompt = (
-            "You are the NextRole AI Command Center. Parse the user's message and determine the intended action.\n"
-            "CRITICAL RULES:\n"
-            "1. ONLY return 'scan_inbox' if the user explicitly asks to 'scan', 'pull', or 'refresh' their inbox now.\n"
-            "2. If the user asks a question about counts (e.g., 'how many emails?'), status updates, or specific companies (e.g., 'Did I hear from X?'), return 'show_updates'.\n"
-            "3. If they are just chatting, return 'unknown'.\n\n"
-            "Possible actions:\n"
-            "- 'connect_gmail': User wants to link their Gmail account.\n"
-            "- 'scan_inbox': Force a fresh scan of the inbox for new messages.\n"
-            "- 'show_updates': Query the current memory for job statuses, email counts, or history. Params: {'query': string|null}.\n"
-            "- 'archive_marketing': Archive newsletters. Params: {'days': int}.\n"
-            "- 'delete_spam': Delete spam. Params: {'days': int}.\n"
-            "- 'unknown': Natural chat without a specific system action.\n\n"
-            "Return JSON: {\"action\": \"...\", \"params\": {...}}.\n\n"
+            "You are the NextRole AI Agent. Parse the user's message and determine the action.\n"
+            "ACTIONS:\n"
+            "- 'scan_inbox': Refresh/scan mail. Params: {'limit': int}. Use limit 500 if they say 'FULL SCAN' or 'WHOLE'.\n"
+            "- 'show_updates': Query job status or email history.\n"
+            "- 'unknown': Natural chat.\n\n"
             f"User Message: {text}"
         )
 
         intent = await self.ai.generate_json(prompt, model_type="lite")
         action = intent.get("action", "unknown")
-        params = intent.get("params", {})
+        params = intent.get("params", {}) or {}
 
         if action == "scan_inbox":
-            await self._send_telegram(chat_id, "🔍 Scanning your inbox for new updates...")
-            total_processed = 0
-            total_updates = 0
-            total_secrets = 0
-            total_failed = 0
+            incomplete = get_incomplete_scan_task(db, user.id)
+            scan_limit = params.get("limit") or 20
+            if "full scan" in text.lower() or "whole" in text.lower():
+                scan_limit = 500
+
+            if incomplete:
+                await self._send_telegram(
+                    chat_id, 
+                    f"🔍 Ooh yeah, I remember I was doing a scan of your last {incomplete.scan_limit} emails, but I ran into a bit of a problem. "
+                    f"I've already finished {incomplete.processed_count}. Let me pick up exactly where I left off!"
+                )
+                scan_id = incomplete.id
+                scan_limit = incomplete.scan_limit
+            else:
+                if scan_limit >= 500:
+                    await self._send_telegram(chat_id, f"🚀 Initiating a **FULL SCAN** of your last {scan_limit} emails. This will be deep and thorough...")
+                else:
+                    await self._send_telegram(chat_id, "🔍 Scanning your inbox for updates...")
+                
+                new_task = start_scan_task(db, user.id, "full_scan", scan_limit)
+                scan_id = new_task.id
             
-            from app.agents.privacy_agent import IngestionPipeline
+            total_processed = 0
+            all_observations = {"spam": [], "newsletter": [], "marketing": []}
+            
             pipeline = IngestionPipeline()
-            # USE scalars().all() to ensure we get Model objects, not Rows.
             accounts = list(db.execute(select(GmailAccount).where(GmailAccount.user_id == user.id)).scalars().all())
 
             for acc in accounts:
                 service = gmail_client.build_service_from_refresh_token(refresh_token_encrypted=acc.oauth_refresh_token_encrypted)
                 res = await pipeline.run_for_account(
-                    db=db, user_id=user.id, telegram_chat_id=chat_id,
-                    gmail_account_id=acc.id, gmail_service=service, gmail_client=gmail_client,
-                    chroma_client=chroma, query="newer_than:1d"
+                    db=db, user_id=user.id, telegram_chat_id=chat_id, 
+                    gmail_account_id=acc.id, gmail_service=service, 
+                    gmail_client=gmail_client, chroma_client=chroma, 
+                    query="in:inbox", max_results=scan_limit,
+                    scan_task_id=scan_id
                 )
                 if isinstance(res, dict):
                     total_processed += res.get("processed", 0)
-                    total_updates += res.get("career_updates", 0)
-                    total_secrets += res.get("secrets_alerted", 0)
-                    total_failed += res.get("failed", 0)
+                    obs = res.get("observations", {})
+                    for k in all_observations:
+                        all_observations[k].extend(obs.get(k, []))
             
-            summary_msg = f"✅ Inbox scan complete!\n- Emails Ingested: {total_processed}\n- Job Updates Found: {total_updates}\n- Secrets Redacted: {total_secrets}"
-            if total_failed > 0:
-                summary_msg += f"\n- ⚠️ Skipped (Errors): {total_failed}"
+            # Agentic Proactive Reasoning
+            report_prompt = (
+                f"Generate a scan summary for {username}. \n"
+                f"Scan Results: {total_processed} new emails ingested.\n"
+                f"Observations: {len(all_observations['spam'])} spam, {len(all_observations['newsletter'])} newsletters.\n"
+                "Task: Write a professional, friendly briefing. If there is spam or newsletters, "
+                "proactively ask if the user wants you to clean them up (archive newsletters or trash spam). "
+                "Be brief and encouraging."
+            )
+            report_text = await self.ai.generate_text(report_prompt, model_type="lite")
             
-            if total_processed == 0 and total_updates == 0 and total_failed == 0:
-                summary_msg = "✅ Scan complete! Your inbox was already up to date."
-                
-            await self._send_telegram(chat_id, summary_msg)
+            # Persist pending actions for confirmation later
+            if all_observations["spam"]:
+                create_pending_action(db, user.id, "trash", f"Delete {len(all_observations['spam'])} spam emails", all_observations["spam"])
+            elif all_observations["newsletter"]:
+                create_pending_action(db, user.id, "archive", f"Archive {len(all_observations['newsletter'])} newsletters", all_observations["newsletter"])
+
+            await self._send_telegram(chat_id, report_text)
             return
 
         if action == "connect_gmail":

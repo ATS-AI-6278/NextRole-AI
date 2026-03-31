@@ -13,6 +13,9 @@ from app.memory.vector.chroma_client import ChromaClient
 from app.memory.relational.repository import record_email_event, record_privacy_flag, upsert_thread
 from app.core.dependencies import get_ai_client, get_chroma_client
 
+from app.agents.classifier_agent import ClassifierAgent
+from app.agents.career_tracker_agent import CareerTrackerAgent
+
 logger = logging.getLogger(__name__)
 
 @dataclass
@@ -81,6 +84,7 @@ def summarize_email_for_vector(subject: str, from_address: str, date: str, body_
 class IngestionPipeline:
     def __init__(self, *, privacy_agent: Optional[PrivacyAgent] = None) -> None:
         self.privacy_agent = privacy_agent or PrivacyAgent()
+        self.ai = get_ai_client()
 
     async def run_for_account(
         self,
@@ -93,8 +97,13 @@ class IngestionPipeline:
         gmail_client: GmailClient,
         chroma_client: ChromaClient,
         query: str,
+        max_results: int = 20,
+        scan_task_id: Optional[int] = None,
     ) -> Dict[str, Any]:
-        all_messages = gmail_client.list_messages(service=gmail_service, query=query, max_results=20)
+        from app.memory.relational.repository import (
+            update_scan_progress, complete_scan_task, fail_scan_task
+        )
+        all_messages = gmail_client.list_messages(service=gmail_service, query=query, max_results=max_results)
         
         # Pre-filter duplicates to get an accurate count of NEW work
         from app.memory.relational.models import EmailEvent
@@ -112,72 +121,147 @@ class IngestionPipeline:
         if total_new == 0:
             return {"processed": 0, "secrets_alerted": 0, "status": "up_to_date"}
 
-        await send_telegram_message(telegram_chat_id, f"📥 Found {total_new} new email(s). Starting analysis and memory linking...")
+        await send_telegram_message(telegram_chat_id, f"📥 Found {total_new} new email(s). Starting Hyper-Efficiency Batch Analysis...")
 
         processed = 0
         secrets_alerted = 0
         career_updates = 0
         failed = 0
+        
+        observations = {"spam": [], "newsletter": [], "marketing": []}
 
-        for i, m in enumerate(new_messages):
-            try:
-                message_id = m.get("message_id")
-                if not message_id:
-                    logger.warning("Skipping message with no ID in ingestion loop.")
-                    continue
-                    
-                thread_id = m.get("thread_id") or ""
-                
-                # Progress Heartbeat (Every 3 emails to show movement)
-                if (i + 1) % 3 == 0 or (i + 1) == total_new:
-                    await send_telegram_message(telegram_chat_id, f"⚙️ Processing... ({i+1}/{total_new} complete)")
+        # CHUNK INTO BATCHES OF 10 (Respects 15 RPM limit)
+        for b_idx in range(0, len(new_messages), 10):
+            # Progress Update: Only print ONCE per batch!
+            await send_telegram_message(telegram_chat_id, f"⚙️ Batch Analysis: {processed}/{total_new} complete...")
 
-                gmail_message = gmail_client.get_message(service=gmail_service, message_id=message_id)
-                logger.info(f"Ingesting Email: {gmail_message.subject[:50]}...")
+            batch = new_messages[b_idx : b_idx + 10]
+            batch_data = []
+            
+            # 1. Fetch metadata for all in batch
+            for m in batch:
+                msg_id = m.get("message_id")
 
-                raw_text = summarize_email_for_vector(gmail_message.subject, gmail_message.from_address, gmail_message.date, gmail_message.body_text)
-
-                detected = await self.privacy_agent.detect_secrets(raw_text)
-                if detected:
-                    secrets_alerted += 1
-                    for d in detected:
-                        record_privacy_flag(db, user_id=user_id, gmail_message_id=message_id, detected_secret_type=d.secret_type)
-                    redacted_text = self.privacy_agent.redact_text(raw_text, detected)
-                else:
-                    redacted_text = raw_text
-
-                upsert_thread(db, user_id=user_id, gmail_thread_id=thread_id)
-                record_email_event(db, user_id=user_id, gmail_message_id=message_id, thread_id=thread_id, event_type="email_ingested")
-                chroma_client.upsert_thread_summary(user_id=user_id, thread_id=thread_id or message_id, summary_text=redacted_text, message_id=message_id, gmail_thread_id=thread_id or None)
-
-                # Classify
                 try:
-                    from app.agents.classifier_agent import ClassifierAgent
-                    classifier = ClassifierAgent()
-                    await classifier.run(text=redacted_text, subject=gmail_message.subject, from_address=gmail_message.from_address, message_id=message_id, thread_id=thread_id)
+                    gmail_message = gmail_client.get_message(service=gmail_service, message_id=msg_id)
+                    batch_data.append({
+                        "id": msg_id,
+                        "tid": m.get("thread_id") or "",
+                        "subject": gmail_message.subject,
+                        "from": gmail_message.from_address,
+                        "date": gmail_message.date,
+                        "body": gmail_message.body_text[:1200] # Snippet for efficient token usage
+                    })
                 except Exception as e:
-                    logger.error(f"Classifier Error: {e}")
+                    logger.error(f"Failed to fetch message {msg_id}: {e}")
+                    failed += 1
 
-                # Career Track
+            if not batch_data:
+                continue
+
+            # 2. Super-Analysis LLM Call
+            prompt = (
+                "Perform Deep Analysis on these emails. For each email, provide:\n"
+                "1. secrets: List of passwords or OTP codes found (type/value).\n"
+                "2. classification: {label, apply_labels, add_label_names, remove_label_names}.\n"
+                "3. career_info: {company, role, status, is_job_related}.\n\n"
+                "Return a JSON list of objects, one per email, with 'id' matching the input.\n\n"
+                f"Emails:\n{json.dumps(batch_data, indent=2)}"
+            )
+            # Use Lite for the complex batch task
+            ai_results = await self.ai.generate_json(prompt, model_type="lite")
+            
+            if not ai_results:
+                logger.error(f"FATAL: AI returned empty response for batch starting at index {b_idx}. Skipping chunk.")
+                failed += len(batch_data)
+                continue
+
+            if not isinstance(ai_results, list):
+                # Fallback if AI returns single object
+                ai_results = [ai_results]
+
+            # 3. Process Batch Results
+            result_map = {str(res.get("id")): res for res in ai_results if res.get("id")}
+
+            for item in batch_data:
+                msg_id = item["id"]
+                thread_id = item["tid"]
+                res = result_map.get(msg_id)
+                if not res:
+                    logger.warning(f"No AI result for {msg_id}, skipping.")
+                    continue
+
                 try:
-                    from app.agents.career_tracker_agent import CareerTrackerAgent
+                    # Redaction & Privacy
+                    detected_secrets = res.get("secrets", [])
+                    redacted_text = item["body"]
+                    if detected_secrets:
+                        secrets_alerted += 1
+                        for s in detected_secrets:
+                            stype = s.get("type", "Secret")
+                            val = s.get("value")
+                            if val:
+                                record_privacy_flag(db, user_id=user_id, gmail_message_id=msg_id, detected_secret_type=stype)
+                                redacted_text = redacted_text.replace(val, f"[REDACTED_{stype}]")
+
+                    # Relational Records
+                    upsert_thread(db, user_id=user_id, gmail_thread_id=thread_id)
+                    record_email_event(db, user_id=user_id, gmail_message_id=msg_id, thread_id=thread_id, event_type="email_ingested")
+                    
+                    # Search Memory (Chroma)
+                    chroma_client.upsert_thread_summary(
+                        user_id=user_id, 
+                        thread_id=thread_id or msg_id, 
+                        summary_text=f"From: {item['from']}\nSubject: {item['subject']}\n{redacted_text}", 
+                        message_id=msg_id, 
+                        gmail_thread_id=thread_id or None
+                    )
+
+                    # Category & Observations
+                    classifier = ClassifierAgent()
+                    class_res = await classifier.run(
+                        text=redacted_text, subject=item["subject"], from_address=item["from"], 
+                        message_id=msg_id, thread_id=thread_id, ai_result=res.get("classification")
+                    )
+                    category = class_res.get("category", "Personal")
+                    if category == "Spam":
+                        observations["spam"].append(msg_id)
+                    elif category == "Newsletter":
+                        observations["newsletter"].append(msg_id)
+                    elif category == "Marketing":
+                        observations["marketing"].append(msg_id)
+
+                    # Career Tracking
                     career = CareerTrackerAgent()
-                    tracker_res = await career.run(db=db, user_id=user_id, message_id=message_id, thread_id=thread_id, text=redacted_text, subject=gmail_message.subject, from_address=gmail_message.from_address, telegram_chat_id=telegram_chat_id)
+                    tracker_res = await career.run(
+                        db=db, user_id=user_id, message_id=msg_id, thread_id=thread_id, 
+                        text=redacted_text, subject=item["subject"], from_address=item["from"], 
+                        date_str=item["date"], telegram_chat_id=telegram_chat_id, 
+                        ai_result=res.get("career_info")
+                    )
                     if tracker_res:
                         career_updates += 1
-                except Exception as e:
-                    logger.error(f"Career Tracker Error: {e}")
 
-                processed += 1
-            except Exception as e:
-                failed += 1
-                logger.error(f"Failed to process email {m.get('message_id')}: {e}")
-                continue
+                    processed += 1
+                except Exception as e:
+                    logger.error(f"Error processing record {msg_id}: {e}")
+                    failed += 1
+
+            # Checkpoint Progress after each batch
+            if scan_task_id:
+                update_scan_progress(db, scan_task_id, processed, batch_data[-1]["id"])
+
+        if scan_task_id:
+            if failed == 0:
+                complete_scan_task(db, scan_task_id)
+            else:
+                fail_scan_task(db, scan_task_id)
 
         return {
             "processed": processed,
             "failed": failed,
             "secrets_alerted": secrets_alerted,
             "career_updates": career_updates,
+            "observations": observations,
             "status": "success" if failed == 0 else "partial_success"
         }

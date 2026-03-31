@@ -1,5 +1,10 @@
 import asyncio
 import logging
+import warnings
+
+# Suppress Python 3.10 deprecation warnings from Google SDK
+warnings.filterwarnings("ignore", category=FutureWarning, module="google.api_core.*")
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 

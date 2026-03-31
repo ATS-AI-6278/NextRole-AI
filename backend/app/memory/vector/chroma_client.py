@@ -57,11 +57,33 @@ class ChromaClient:
         if gmail_thread_id:
             metadata["gmail_thread_id"] = gmail_thread_id
 
-        # Chroma uses add for upsert-like behavior when ids are unique.
+        # Chroma uses upsert for stable overwrites
         self.collection.upsert(
             ids=[doc_id],
             metadatas=[metadata],
             documents=[summary_text],
+        )
+
+    def delete_message_summaries(
+        self,
+        *,
+        user_id: int,
+        message_ids: List[str],
+    ) -> None:
+        """
+        Remove specified messages from the vector DB memory to keep it clean.
+        """
+        if not message_ids:
+            return
+        
+        # Use metadata filter to find and delete junk
+        self.collection.delete(
+            where={
+                "$and": [
+                    {"user_id": user_id},
+                    {"message_id": {"$in": message_ids}}
+                ]
+            }
         )
 
     def add_chat_message(

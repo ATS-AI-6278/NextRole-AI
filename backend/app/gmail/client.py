@@ -204,11 +204,27 @@ class GmailClient:
             body["removeLabelIds"] = remove_label_ids
         service.users().messages().modify(userId="me", id=message_id, body=body).execute()
 
+    def batch_modify_labels(
+        self,
+        *,
+        service,
+        message_ids: List[str],
+        add_label_ids: Optional[List[str]] = None,
+        remove_label_ids: Optional[List[str]] = None,
+    ) -> None:
+        if not message_ids:
+            return
+        body: Dict[str, Any] = {"ids": message_ids}
+        if add_label_ids:
+            body["addLabelIds"] = add_label_ids
+        if remove_label_ids:
+            body["removeLabelIds"] = remove_label_ids
+        service.users().messages().batchModify(userId="me", body=body).execute()
+
     def trash_message(self, *, service, message_id: str) -> None:
         self.modify_labels(service=service, message_id=message_id, add_label_ids=["TRASH"], remove_label_ids=["INBOX"])
 
     def archive_message(self, *, service, message_id: str) -> None:
-        # Gmail archive is "remove INBOX".
         self.modify_labels(service=service, message_id=message_id, remove_label_ids=["INBOX"])
 
     def get_profile_email(self, *, service) -> str:
