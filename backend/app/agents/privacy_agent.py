@@ -2,6 +2,7 @@ import re
 import json
 import logging
 import httpx
+import asyncio
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session
@@ -150,7 +151,7 @@ class IngestionPipeline:
                         "subject": gmail_message.subject,
                         "from": gmail_message.from_address,
                         "date": gmail_message.date,
-                        "body": gmail_message.body_text[:1200] # Snippet for efficient token usage
+                        "body": gmail_message.body_text[:600] # Compressed snippet for Gemma TPM Limits
                     })
                 except Exception as e:
                     logger.error(f"Failed to fetch message {msg_id}: {e}")
@@ -168,8 +169,8 @@ class IngestionPipeline:
                 "Return a JSON list of objects, one per email, with 'id' matching the input.\n\n"
                 f"Emails:\n{json.dumps(batch_data, indent=2)}"
             )
-            # Use Lite for the complex batch task
-            ai_results = await self.ai.generate_json(prompt, model_type="lite")
+            # Use Gemma for the complex batch task (preserves rate limits)
+            ai_results = await self.ai.generate_json(prompt, model_type="gemma")
             
             if not ai_results:
                 logger.error(f"FATAL: AI returned empty response for batch starting at index {b_idx}. Skipping chunk.")
@@ -250,6 +251,10 @@ class IngestionPipeline:
             # Checkpoint Progress after each batch
             if scan_task_id:
                 update_scan_progress(db, scan_task_id, processed, batch_data[-1]["id"])
+
+            # Pacing to avoid hitting 15K TPM limits on Gemma
+            if (b_idx + 10) < total_new:
+                await asyncio.sleep(8)
 
         if scan_task_id:
             if failed == 0:
