@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+sqlalchemy
+alembic
+httpx
+apscheduler
+chromadb
+sentence-transformers
+google-api-python-client
+google-auth
+google-auth-oauthlib
+cryptography

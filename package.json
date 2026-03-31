@@ -1,0 +1,14 @@
+{
+  "name": "nextrole-ai",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "dev:frontend": "npm run dev --prefix frontend",
+    "dev:backend": "cd backend && .\\.venv\\Scripts\\uvicorn app.main:app --reload --port 8000",
+    "setup:backend": "cd backend && python -m venv .venv && .\\.venv\\Scripts\\activate && pip install -r requirements.txt"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
