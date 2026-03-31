@@ -83,9 +83,9 @@ class CareerTrackerAgent:
         if not result or not result.get("is_job_related"):
             return None
 
-        company = result.get("company", "Unknown Company")
+        company = result.get("company") or "Unknown Company"
         role = result.get("role")
-        status = result.get("status", "Applied")
+        status = result.get("status") or "Applied"
         msg_date = self._parse_email_date(date_str)
 
         # Priority 1: Match by Thread ID
