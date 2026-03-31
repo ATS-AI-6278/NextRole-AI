@@ -1,7 +1,0 @@
-{
-  "version": 3,
-  "sources": [],
-  "sections": [
-    {"offset": {"line": 4, "column": 0}, "map": {"version":3,"sources":["file:///C:/Users/arumu/Documents/Projects/2026/Email-AI-System/frontend/app/layout.tsx"],"sourcesContent":["import type { Metadata } from \"next\";\r\nimport type { ReactNode } from \"react\";\r\n\r\nexport const metadata: Metadata = {\r\n  title: \"NextRole AI\",\r\n  description: \"Job application tracker dashboard\",\r\n};\r\n\r\nexport default function RootLayout({ children }: { children: ReactNode }) {\r\n  return (\r\n    <html lang=\"en\">\r\n      <body>{children}</body>\r\n    </html>\r\n  );\r\n}\r\n\r\n"],"names":["metadata","title","description","RootLayout","children","lang"],"mappings":";;;;;;;;AAGO,MAAMA,WAAqB;IAChCC,OAAO;IACPC,aAAa;AACf;AAEe,SAASC,WAAW,EAAEC,QAAQ,EAA2B;IACtE,qBACE,oTAAC;QAAKC,MAAK;kBACT,cAAA,oTAAC;sBAAMD;;;;;;;;;;;AAGb"}},
-    {"offset": {"line": 40, "column": 0}, "map": {"version":3,"sources":["file:///C:/Users/arumu/Documents/Projects/2026/Email-AI-System/frontend/node_modules/next/src/server/route-modules/app-page/vendored/rsc/react-jsx-dev-runtime.ts"],"sourcesContent":["module.exports = (\n  require('../../module.compiled') as typeof import('../../module.compiled')\n).vendored['react-rsc']!.ReactJsxDevRuntime\n"],"names":["module","exports","require","vendored","ReactJsxDevRuntime"],"mappings":"AAAAA,OAAOC,OAAO,GACZC,QAAQ,6KACRC,QAAQ,CAAC,YAAY,CAAEC,kBAAkB","ignoreList":[0]}}]
-}

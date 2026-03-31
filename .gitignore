@@ -1,4 +1,15 @@
+# Next.js build output
+frontend/.next/
+
+# Or more generally
+.next/
+
+# Node
 node_modules/
+
+# Python
 .venv/
 __pycache__/
+
+# Env & DB
 .env
