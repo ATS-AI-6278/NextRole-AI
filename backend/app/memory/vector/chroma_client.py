@@ -32,7 +32,11 @@ class ChromaClient:
         )
         self.client = chromadb.PersistentClient(path=self.persist_dir)
         self.collection = self.client.get_or_create_collection(
-            name=self.collection_name,
+            name="thread_summaries",
+            embedding_function=self.embedding_fn,
+        )
+        self.chat_collection = self.client.get_or_create_collection(
+            name="chat_history",
             embedding_function=self.embedding_fn,
         )
 
@@ -60,14 +64,73 @@ class ChromaClient:
             documents=[summary_text],
         )
 
-    def query_similar_threads(
+    def add_chat_message(
+        self,
+        *,
+        user_id: int,
+        text: str,
+        role: str, # "user" or "bot"
+    ) -> None:
+        """
+        Record a chat message in the vector DB for long-term memory.
+        """
+        import time
+        doc_id = f"{user_id}:{time.time_ns()}"
+        metadata: Dict[str, Any] = {
+            "user_id": user_id,
+            "role": role,
+            "timestamp": time.time(),
+        }
+        self.chat_collection.add(
+            ids=[doc_id],
+            metadatas=[metadata],
+            documents=[text],
+        )
+
+    def search_threads(
         self,
         *,
         user_id: int,
         query_text: str,
         top_k: int = 5,
     ) -> List[SimilarThreadResult]:
+        """
+        Search for similar threads in ChromaDB.
+        """
         results = self.collection.query(
+            query_texts=[query_text],
+            n_results=top_k,
+            where={"user_id": user_id},
+        )
+
+        out: List[SimilarThreadResult] = []
+        ids = results.get("ids", [[]])[0] or []
+        docs = results.get("documents", [[]])[0] or []
+        metas = results.get("metadatas", [[]])[0] or []
+        scores = results.get("distances", [[]])[0] or results.get("scores", [[]])[0] or []
+
+        for i, doc_id in enumerate(ids):
+            out.append(
+                SimilarThreadResult(
+                    id=str(doc_id),
+                    text=str(docs[i]) if i < len(docs) else "",
+                    score=float(scores[i]) if i < len(scores) else 0.0,
+                    metadata=dict(metas[i]) if i < len(metas) and metas[i] else {},
+                )
+            )
+        return out
+
+    def search_chat_history(
+        self,
+        *,
+        user_id: int,
+        query_text: str,
+        top_k: int = 5,
+    ) -> List[SimilarThreadResult]:
+        """
+        Search for relevant past conversations in ChromaDB.
+        """
+        results = self.chat_collection.query(
             query_texts=[query_text],
             n_results=top_k,
             where={"user_id": user_id},

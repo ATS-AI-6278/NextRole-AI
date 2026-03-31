@@ -19,18 +19,18 @@ class CareerTrackerAgent:
     def __init__(self) -> None:
         self.ai = AIClient()
 
-    def _send_priority_telegram(self, chat_id: Optional[str], text: str) -> None:
+    async def _send_priority_telegram(self, chat_id: Optional[str], text: str) -> None:
         if not chat_id or not settings.TELEGRAM_BOT_TOKEN:
             return
         try:
-            import httpx
-            httpx.post(
-                f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": chat_id, "text": text},
-                timeout=10,
-            )
-        except Exception:
-            pass
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.post(
+                    f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json={"chat_id": chat_id, "text": text},
+                )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"Failed to send priority Telegram message: {e}")
 
     def _find_latest_job_for_company(self, db: Session, user_id: int, company: str) -> Optional[JobApplication]:
         stmt = (
@@ -54,22 +54,24 @@ class CareerTrackerAgent:
         telegram_chat_id: Optional[str] = None,
     ) -> Optional[dict]:
         """
-        Use LLM to extract job details and update the database.
+        - [x] **Memory System Improvements**
+          - [x] Implement `ChatHistory` collection in `ChromaClient`
+          - [x] Add methods for `add_chat_message` and `query_chat_history`
+        - [x] **Execution Agent Upgrade**
+          - [x] Refactor `handle_update` to retrieve and include chat history context
+          - [x] Improve natural language intent parsing
+        - [x] **Career & Proactive Alerts**
+          - [x] Update `CareerTrackerAgent` to support direct Telegram alerts for high-priority statuses
+          - [x] Ensure `IngestionPipeline` correctly routes status update results to the user
         """
-        combined = f"Subject: {subject}\nFrom: {from_address}\n\n{text}".strip()
-
         prompt = (
-            "You are a Career Tracking AI for NextRole AI. Analyze the following email regarding job applications.\n"
-            "Identify if this is a 'New Application' confirmation or a 'Status Update' (Interview, Rejected, Offer).\n\n"
-            "Rules:\n"
-            "1. Extract 'company' name precisely.\n"
-            "2. Extract 'role' (job title) if present.\n"
-            "3. Determine 'status': one of [Applied, Interview, Rejected, Offer].\n"
-            "4. Return JSON: {\"is_job_related\": bool, \"is_new_application\": bool, \"company\": \"...\", \"role\": \"...\", \"status\": \"...\"}.\n\n"
-            f"Email Content:\n{combined}"
+            "Extract job application details from this email. "
+            "Focus only on Company Name, Job Role, and Status (Applied, Interviewing, Rejected, Offer).\n"
+            "Return JSON: {\"company\": \"string\", \"role\": \"string\", \"status\": \"string\", \"is_job_related\": bool}.\n\n"
+            f"Subject: {subject}\nBody: {text[:2000]}"
         )
-
-        result = await self.ai.generate_json(prompt)
+        # Use lite model for extraction
+        result = await self.ai.generate_json(prompt, model_type="lite")
         if not result or not result.get("is_job_related"):
             return None
 
@@ -98,9 +100,14 @@ class CareerTrackerAgent:
         if job and job.status != status:
             update_job_status(db=db, job_id=job.id, new_status=status, source_message_id=message_id)
             if status in {"Interview", "Offer"}:
-                self._send_priority_telegram(
+                await self._send_priority_telegram(
                     telegram_chat_id,
-                    text=f"🚀 Priority Update: {company} changed status to {status}!"
+                    text=f"🔔 PRIORITY UPDATE: {company} has moved your application for '{role or 'position'}' to '{status.upper()}'! Check your email for more details."
+                )
+            elif status == "Rejected":
+                await self._send_priority_telegram(
+                    telegram_chat_id,
+                    text=f"Status Update: {company} updated your application for '{role or 'position'}' to 'Rejected'. I've recorded this in your history."
                 )
             return {"updated": True, "company": company, "to": status}
 

@@ -16,7 +16,7 @@ def init_db(engine) -> None:
 
 def get_or_create_user_by_chat_id(db: Session, telegram_chat_id: str) -> User:
     stmt = select(User).where(User.telegram_chat_id == telegram_chat_id)
-    user = db.execute(stmt).scalar_one_or_none()
+    user = db.execute(stmt).scalars().first()
     if user:
         return user
 
@@ -29,7 +29,7 @@ def get_or_create_user_by_chat_id(db: Session, telegram_chat_id: str) -> User:
 
 def get_or_create_gmail_account(db: Session, user_id: int, email_address: str, oauth_refresh_token_encrypted: str) -> GmailAccount:
     stmt = select(GmailAccount).where(GmailAccount.user_id == user_id, GmailAccount.email_address == email_address)
-    account = db.execute(stmt).scalar_one_or_none()
+    account = db.execute(stmt).scalars().first()
     if account:
         return account
 
@@ -46,7 +46,7 @@ def get_or_create_gmail_account(db: Session, user_id: int, email_address: str, o
 
 def upsert_thread(db: Session, user_id: int, gmail_thread_id: str, labels_applied: Optional[Dict[str, Any]] = None) -> Thread:
     stmt = select(Thread).where(Thread.user_id == user_id, Thread.gmail_thread_id == gmail_thread_id)
-    thread = db.execute(stmt).scalar_one_or_none()
+    thread = db.execute(stmt).scalars().first()
     if thread:
         if labels_applied is not None:
             thread.labels_applied = labels_applied
@@ -95,7 +95,7 @@ def list_job_applications(db: Session, user_id: int, limit: int = 200) -> List[J
 
 
 def update_job_status(db: Session, job_id: int, new_status: str, *, source_message_id: Optional[str] = None) -> JobApplication:
-    job = db.execute(select(JobApplication).where(JobApplication.id == job_id)).scalar_one_or_none()
+    job = db.execute(select(JobApplication).where(JobApplication.id == job_id)).scalars().first()
     # If not found, create logic can be added later; for now we fail clearly.
     if job is None:
         raise ValueError(f"JobApplication not found: {job_id}")

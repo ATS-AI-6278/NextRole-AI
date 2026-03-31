@@ -40,34 +40,36 @@ class ClassifierAgent:
     ) -> dict:
         """
         Use LLM to categorize the email.
-        Returns a structure the caller can use to apply Gmail labels.
         """
-        combined = f"Subject: {subject}\nFrom: {from_address}\n\n{text}".strip()
-        category = await self.classify(combined)
-
-        add_label = self.CATEGORY_LABELS.get(category, "Personal")
+        prompt = (
+            "Categorize this email into exactly one of these labels: 'Job Application', 'Newsletter', 'Marketing', 'Spam', 'Personal'.\n"
+            "Also decide if we should archive it (Newsletter/Marketing) or move to trash (Spam).\n"
+            "Return JSON: {\"label\": \"string\", \"apply_labels\": bool, \"add_label_names\": [\"string\"], \"remove_label_names\": [\"string\"]}.\n\n"
+            f"Subject: {subject}\nFrom: {from_address}\nBody: {text[:1000]}"
+        )
+        # Use gemma for fast classification
+        result = await self.ai.generate_json(prompt, model_type="gemma")
         
+        # Ensure 'label' maps to CATEGORY_LABELS or default
+        label = result.get("label", "Personal")
+        add_labels = result.get("add_label_names", [])
+        if not add_labels and label in self.CATEGORY_LABELS:
+            add_labels = [self.CATEGORY_LABELS[label]]
+
         return {
-            "category": category,
-            "apply_labels": True,
-            "add_label_names": [add_label],
-            "remove_label_names": [],
+            "category": label,
+            "apply_labels": result.get("apply_labels", True),
+            "add_label_names": add_labels,
+            "remove_label_names": result.get("remove_label_names", []),
         }
 
     async def classify(self, text: str) -> str:
+        # Legacy method if still called elsewhere
         prompt = (
-            "You are an Email Classifier AI for NextRole AI. Categorize the following email into "
-            "one of these types: [Job_Applied, Job_Offer, Newsletter, Spam, Personal].\n"
-            "- Job_Applied: Application confirmation emails.\n"
-            "- Job_Offer: Interview invitations or job offers.\n"
-            "- Newsletter: Marketing emails, weekly digests, or promotional content.\n"
-            "- Spam: Fraud, scams, or obvious junk.\n"
-            "- Personal: Direct correspondence or personal matters.\n\n"
-            "Return JSON: {\"category\": \"...\", \"reason\": \"...\"}.\n\n"
+            "Categorize the following email into one of these types: [Job_Applied, Job_Offer, Newsletter, Spam, Personal].\n\n"
             f"Email Content:\n{text}"
         )
-        
-        result = await self.ai.generate_json(prompt)
+        result = await self.ai.generate_json(prompt, model_type="gemma")
         return result.get("category", "Personal")
 
     def apply_labels(

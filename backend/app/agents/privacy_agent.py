@@ -1,20 +1,19 @@
-from __future__ import annotations
-
 import re
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
-
+import json
+import logging
 import httpx
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session
+from sqlalchemy import select
 
 from app.core.config import settings
 from app.gmail.client import GmailClient
-from app.memory.relational.models import EmailEvent, PrivacyFlag
-from app.memory.relational.repository import record_email_event, record_privacy_flag, upsert_thread
 from app.memory.vector.chroma_client import ChromaClient
+from app.memory.relational.repository import record_email_event, record_privacy_flag, upsert_thread
+from app.core.dependencies import get_ai_client, get_chroma_client
 
-
-from app.core.ai_client import AIClient
+logger = logging.getLogger(__name__)
 
 @dataclass
 class DetectedSecret:
@@ -23,45 +22,32 @@ class DetectedSecret:
 
 
 class PrivacyAgent:
-    """
-    Detect sensitive secrets (OTP/password/verification codes) and redact them before:
-    - logging
-    - saving structured memory
-    - saving embeddings (vector memory)
-    """
-
     def __init__(self) -> None:
-        self.ai = AIClient()
-        # Keep patterns simple for fast preliminary pass.
+        self.ai = get_ai_client()
         self.OTP_RE = re.compile(r"\b(?:OTP|one[-\s]?time|verification code)\b[^0-9A-Za-z]{0,20}(\d{4,8})\b", re.I)
         self.GENERIC_6_DIGIT_RE = re.compile(r"\b(\d{6})\b")
 
     async def detect_secrets(self, text: str) -> List[DetectedSecret]:
         found: List[DetectedSecret] = []
-
-        # 1. Fast Regex Pass (Heuristic)
         for m in self.OTP_RE.finditer(text):
             found.append(DetectedSecret(secret_type="OTP", matched_value=m.group(1)))
-        
         for m in self.GENERIC_6_DIGIT_RE.finditer(text):
             found.append(DetectedSecret(secret_type="OTP", matched_value=m.group(1)))
 
-        # 2. LLM Pass (Contextual)
+        text_for_llm = self.redact_text(text, found)
         prompt = (
             "Analyze the following email and identify any highly sensitive transient secrets "
-            "like OTPs, temporary passwords, or verification codes. "
-            "Return a JSON list of objects: [{\"secret_type\": \"OTP|Password|VerificationCode\", \"matched_value\": \"...\"}]. "
+            "like passwords or verification phrases. "
+            "Return a JSON list: [{\"secret_type\": \"Password|VerificationCode\", \"matched_value\": \"...\"}]. "
             "Important: Do not include IDs, tracking numbers, or public info.\n\n"
-            f"Email Content:\n{text}"
+            f"Email Content:\n{text_for_llm}"
         )
-        
-        llm_results = await self.ai.generate_json(prompt)
+        llm_results = await self.ai.generate_json(prompt, model_type="gemma")
         if isinstance(llm_results, list):
             for item in llm_results:
                 if "secret_type" in item and "matched_value" in item:
                     found.append(DetectedSecret(secret_type=item["secret_type"], matched_value=str(item["matched_value"])))
 
-        # De-dup by (type,value)
         uniq: Dict[Tuple[str, str], DetectedSecret] = {}
         for d in found:
             uniq[(d.secret_type, d.matched_value)] = d
@@ -78,10 +64,8 @@ class PrivacyAgent:
 
 
 async def send_telegram_message(chat_id: str, text: str) -> None:
-    if not settings.TELEGRAM_BOT_TOKEN:
-        # In dev without credentials, we just no-op.
+    if not settings.TELEGRAM_BOT_TOKEN or not chat_id:
         return
-
     async with httpx.AsyncClient(timeout=10) as client:
         await client.post(
             f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -110,109 +94,90 @@ class IngestionPipeline:
         chroma_client: ChromaClient,
         query: str,
     ) -> Dict[str, Any]:
-        """
-        MVP ingestion:
-        - Pull messages matching `query`
-        - Detect+redact secrets
-        - Store privacy flags (types only) and vector/relational memory using redacted content
-        - Optionally invoke downstream agents (classifier/career) if present
-        """
+        all_messages = gmail_client.list_messages(service=gmail_service, query=query, max_results=20)
+        
+        # Pre-filter duplicates to get an accurate count of NEW work
+        from app.memory.relational.models import EmailEvent
+        new_messages = []
+        for m in all_messages:
+            msg_id = m.get("message_id")
+            if not msg_id:
+                logger.warning("Found message dict missing 'message_id' in list response.")
+                continue
+            exists = db.execute(select(EmailEvent).where(EmailEvent.gmail_message_id == msg_id)).scalars().first()
+            if not exists:
+                new_messages.append(m)
 
-        messages = gmail_client.list_messages(service=gmail_service, query=query, max_results=50)
+        total_new = len(new_messages)
+        if total_new == 0:
+            return {"processed": 0, "secrets_alerted": 0, "status": "up_to_date"}
+
+        await send_telegram_message(telegram_chat_id, f"📥 Found {total_new} new email(s). Starting analysis and memory linking...")
+
         processed = 0
         secrets_alerted = 0
+        career_updates = 0
+        failed = 0
 
-        for m in messages:
-            message_id = m["message_id"]
-            thread_id = m.get("thread_id") or ""
-            gmail_message = gmail_client.get_message(service=gmail_service, message_id=message_id)
-
-            raw_text = summarize_email_for_vector(
-                gmail_message.subject,
-                gmail_message.from_address,
-                gmail_message.date,
-                gmail_message.body_text,
-            )
-
-            detected = await self.privacy_agent.detect_secrets(raw_text)
-            if detected:
-                secrets_alerted += 1
-                # Record type-only flags (no secret values).
-                for d in detected:
-                    record_privacy_flag(db, user_id=user_id, gmail_message_id=message_id, detected_secret_type=d.secret_type)
-
-                # Alert user immediately; do not include full values.
-                types = sorted({d.secret_type for d in detected})
-                await send_telegram_message(
-                    chat_id=telegram_chat_id,
-                    text=f"Sensitive info detected in Gmail email. Types: {', '.join(types)}. I redacted it and will not store it.",
-                )
-                redacted_text = self.privacy_agent.redact_text(raw_text, detected)
-            else:
-                redacted_text = raw_text
-
-            # Thread upsert for later linkage.
-            upsert_thread(db, user_id=user_id, gmail_thread_id=thread_id, labels_applied=None)
-
-            # Relational memory: store an ingestion event with extracted entities later.
-            record_email_event(
-                db,
-                user_id=user_id,
-                gmail_message_id=message_id,
-                thread_id=thread_id,
-                event_type="email_ingested",
-                extracted_entities=None,
-            )
-
-            # Vector memory: store redacted summary (privacy-forward).
-            chroma_client.upsert_thread_summary(
-                user_id=user_id,
-                thread_id=thread_id or message_id,
-                summary_text=redacted_text,
-                message_id=message_id,
-                gmail_thread_id=thread_id or None,
-            )
-
-            processed += 1
-
-            # Downstream: run if/when the modules exist.
+        for i, m in enumerate(new_messages):
             try:
-                from app.agents.classifier_agent import ClassifierAgent  # type: ignore
-                classifier = ClassifierAgent()
-                classifier_result = await classifier.run(
-                    text=redacted_text,
-                    subject=gmail_message.subject,
-                    from_address=gmail_message.from_address,
-                    message_id=message_id,
-                    thread_id=thread_id,
-                )
-                if classifier_result.get("apply_labels"):
-                    classifier.apply_labels(
-                        service=gmail_service,
-                        gmail_client=gmail_client,
-                        message_id=message_id,
-                        add_label_names=classifier_result.get("add_label_names") or [],
-                        remove_label_names=classifier_result.get("remove_label_names") or [],
-                    )
+                message_id = m.get("message_id")
+                if not message_id:
+                    logger.warning("Skipping message with no ID in ingestion loop.")
+                    continue
+                    
+                thread_id = m.get("thread_id") or ""
+                
+                # Progress Heartbeat (Every 3 emails to show movement)
+                if (i + 1) % 3 == 0 or (i + 1) == total_new:
+                    await send_telegram_message(telegram_chat_id, f"⚙️ Processing... ({i+1}/{total_new} complete)")
+
+                gmail_message = gmail_client.get_message(service=gmail_service, message_id=message_id)
+                logger.info(f"Ingesting Email: {gmail_message.subject[:50]}...")
+
+                raw_text = summarize_email_for_vector(gmail_message.subject, gmail_message.from_address, gmail_message.date, gmail_message.body_text)
+
+                detected = await self.privacy_agent.detect_secrets(raw_text)
+                if detected:
+                    secrets_alerted += 1
+                    for d in detected:
+                        record_privacy_flag(db, user_id=user_id, gmail_message_id=message_id, detected_secret_type=d.secret_type)
+                    redacted_text = self.privacy_agent.redact_text(raw_text, detected)
+                else:
+                    redacted_text = raw_text
+
+                upsert_thread(db, user_id=user_id, gmail_thread_id=thread_id)
+                record_email_event(db, user_id=user_id, gmail_message_id=message_id, thread_id=thread_id, event_type="email_ingested")
+                chroma_client.upsert_thread_summary(user_id=user_id, thread_id=thread_id or message_id, summary_text=redacted_text, message_id=message_id, gmail_thread_id=thread_id or None)
+
+                # Classify
+                try:
+                    from app.agents.classifier_agent import ClassifierAgent
+                    classifier = ClassifierAgent()
+                    await classifier.run(text=redacted_text, subject=gmail_message.subject, from_address=gmail_message.from_address, message_id=message_id, thread_id=thread_id)
+                except Exception as e:
+                    logger.error(f"Classifier Error: {e}")
+
+                # Career Track
+                try:
+                    from app.agents.career_tracker_agent import CareerTrackerAgent
+                    career = CareerTrackerAgent()
+                    tracker_res = await career.run(db=db, user_id=user_id, message_id=message_id, thread_id=thread_id, text=redacted_text, subject=gmail_message.subject, from_address=gmail_message.from_address, telegram_chat_id=telegram_chat_id)
+                    if tracker_res:
+                        career_updates += 1
+                except Exception as e:
+                    logger.error(f"Career Tracker Error: {e}")
+
+                processed += 1
             except Exception as e:
-                # MVP: do not fail ingestion if classifier isn't implemented or errors.
-                logger.error(f"Classifier Error: {e}")
+                failed += 1
+                logger.error(f"Failed to process email {m.get('message_id')}: {e}")
+                continue
 
-            try:
-                from app.agents.career_tracker_agent import CareerTrackerAgent  # type: ignore
-                career = CareerTrackerAgent()
-                await career.run(
-                    db=db,
-                    user_id=user_id,
-                    message_id=message_id,
-                    thread_id=thread_id,
-                    text=redacted_text,
-                    subject=gmail_message.subject,
-                    from_address=gmail_message.from_address,
-                    telegram_chat_id=telegram_chat_id,
-                )
-            except Exception as e:
-                logger.error(f"Career Tracker Error: {e}")
-
-        return {"processed": processed, "secrets_alerted": secrets_alerted}
-
+        return {
+            "processed": processed,
+            "failed": failed,
+            "secrets_alerted": secrets_alerted,
+            "career_updates": career_updates,
+            "status": "success" if failed == 0 else "partial_success"
+        }

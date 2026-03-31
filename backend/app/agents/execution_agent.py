@@ -13,11 +13,14 @@ from app.memory.relational.models import GmailAccount, JobApplication
 from app.memory.relational.repository import get_or_create_user_by_chat_id
 
 
-from app.core.ai_client import AIClient
+from app.core.dependencies import get_ai_client, get_chroma_client
+
+import logging
+logger = logging.getLogger(__name__)
 
 class ExecutionAgent:
     def __init__(self) -> None:
-        self.ai = AIClient()
+        self.ai = get_ai_client()
 
     def _normalize(self, text: str) -> str:
         return (text or "").strip()
@@ -51,6 +54,9 @@ class ExecutionAgent:
 
         user = get_or_create_user_by_chat_id(db, telegram_chat_id=chat_id)
         gmail_client = GmailClient()
+        chroma = get_chroma_client()
+
+        logger.info(f"Telegram Update: User={chat_id} Text='{text[:50]}...'")
 
         if text.startswith("/start"):
             await self._send_telegram(
@@ -60,26 +66,66 @@ class ExecutionAgent:
                 "Try asking:\n"
                 "- 'How are my job applications doing?'\n"
                 "- 'Did I hear back from Google?'\n"
-                "- 'Clean up my newsletters from today.'\n"
+                "- 'Scan my inbox now.'\n"
                 "- 'Connect my Gmail account.'"
             )
             return
 
         prompt = (
             "You are the NextRole AI Command Center. Parse the user's message and determine the intended action.\n"
+            "CRITICAL RULES:\n"
+            "1. ONLY return 'scan_inbox' if the user explicitly asks to 'scan', 'pull', or 'refresh' their inbox now.\n"
+            "2. If the user asks a question about counts (e.g., 'how many emails?'), status updates, or specific companies (e.g., 'Did I hear from X?'), return 'show_updates'.\n"
+            "3. If they are just chatting, return 'unknown'.\n\n"
             "Possible actions:\n"
             "- 'connect_gmail': User wants to link their Gmail account.\n"
-            "- 'show_updates': User wants to see job application statuses. Params: {'company': string|null}.\n"
-            "- 'archive_marketing': User wants to archive newsletters/marketing. Params: {'days': int}.\n"
-            "- 'delete_spam': User wants to move spam to trash. Params: {'days': int}.\n"
-            "- 'unknown': Default if no action matches.\n\n"
+            "- 'scan_inbox': Force a fresh scan of the inbox for new messages.\n"
+            "- 'show_updates': Query the current memory for job statuses, email counts, or history. Params: {'query': string|null}.\n"
+            "- 'archive_marketing': Archive newsletters. Params: {'days': int}.\n"
+            "- 'delete_spam': Delete spam. Params: {'days': int}.\n"
+            "- 'unknown': Natural chat without a specific system action.\n\n"
             "Return JSON: {\"action\": \"...\", \"params\": {...}}.\n\n"
             f"User Message: {text}"
         )
 
-        intent = await self.ai.generate_json(prompt)
+        intent = await self.ai.generate_json(prompt, model_type="lite")
         action = intent.get("action", "unknown")
         params = intent.get("params", {})
+
+        if action == "scan_inbox":
+            await self._send_telegram(chat_id, "🔍 Scanning your inbox for new updates...")
+            total_processed = 0
+            total_updates = 0
+            total_secrets = 0
+            total_failed = 0
+            
+            from app.agents.privacy_agent import IngestionPipeline
+            pipeline = IngestionPipeline()
+            # USE scalars().all() to ensure we get Model objects, not Rows.
+            accounts = list(db.execute(select(GmailAccount).where(GmailAccount.user_id == user.id)).scalars().all())
+
+            for acc in accounts:
+                service = gmail_client.build_service_from_refresh_token(refresh_token_encrypted=acc.oauth_refresh_token_encrypted)
+                res = await pipeline.run_for_account(
+                    db=db, user_id=user.id, telegram_chat_id=chat_id,
+                    gmail_account_id=acc.id, gmail_service=service, gmail_client=gmail_client,
+                    chroma_client=chroma, query="newer_than:1d"
+                )
+                if isinstance(res, dict):
+                    total_processed += res.get("processed", 0)
+                    total_updates += res.get("career_updates", 0)
+                    total_secrets += res.get("secrets_alerted", 0)
+                    total_failed += res.get("failed", 0)
+            
+            summary_msg = f"✅ Inbox scan complete!\n- Emails Ingested: {total_processed}\n- Job Updates Found: {total_updates}\n- Secrets Redacted: {total_secrets}"
+            if total_failed > 0:
+                summary_msg += f"\n- ⚠️ Skipped (Errors): {total_failed}"
+            
+            if total_processed == 0 and total_updates == 0 and total_failed == 0:
+                summary_msg = "✅ Scan complete! Your inbox was already up to date."
+                
+            await self._send_telegram(chat_id, summary_msg)
+            return
 
         if action == "connect_gmail":
             start_url = f"{settings.TELEGRAM_BASE_URL.rstrip('/')}/gmail/oauth/start?chat_id={chat_id}"
@@ -87,12 +133,25 @@ class ExecutionAgent:
             return
 
         if action == "show_updates":
-            company_kw = params.get("company")
+            query = params.get("query")
+            logger.info(f"Action: show_updates Query='{query}'")
+            # Intelligent Context Search: Query Vector DB for semantic matches first
+            context_results = chroma.search_threads(user_id=user.id, query_text=text, top_k=3)
+            context_text = "\n".join([r.text for r in context_results]) if context_results else ""
+            
             stmt = select(JobApplication).where(JobApplication.user_id == user.id).order_by(JobApplication.last_status_at.desc())
             jobs = list(db.execute(stmt).scalars().all())
-            if company_kw:
-                jobs = [j for j in jobs if company_kw.lower() in (j.company or "").lower() or (j.role or "").lower().find(company_kw.lower()) >= 0]
-            await self._send_telegram(chat_id, self._format_job_updates(jobs))
+            
+            summary_prompt = (
+                f"User asked: '{text}'\n\n"
+                f"Job Database Statuses:\n{self._format_job_updates(jobs)}\n\n"
+                f"Relevant Email Context:\n{context_text}\n\n"
+                "Provide a natural, helpful response to the user. "
+                "If they asked about a specific company, focus on that."
+            )
+            # Use core model for final synthesis
+            response_text = await self.ai.generate_text(summary_prompt, model_type="core")
+            await self._send_telegram(chat_id, response_text)
             return
 
         if action == "archive_marketing":
@@ -129,8 +188,36 @@ class ExecutionAgent:
             await self._send_telegram(chat_id, f"Moved {processed} spam emails from the last {days} day(s) to Trash.")
             return
 
-        await self._send_telegram(
-            chat_id,
-            "I'm not sure how to do that yet. Try asking for job updates or to clean your inbox!"
+        # DEFAULT: Natural Chatting Engagement & Long-Term Memory
+        logger.info(f"Action: natural_chat User={user.id}")
+        # 1. Record User Message in Chat Memory
+        chroma.add_chat_message(user_id=user.id, text=text, role="user")
+
+        # 2. Search for relevant context across both domains
+        email_context_results = chroma.search_threads(user_id=user.id, query_text=text, top_k=5)
+        chat_history_results = chroma.search_chat_history(user_id=user.id, query_text=text, top_k=3)
+
+        email_context = "\n".join([r.text for r in email_context_results]) if email_context_results else "No relevant email context."
+        chat_context = "\n".join([f"{r.metadata.get('role', 'unknown')}: {r.text}" for r in chat_history_results]) if chat_history_results else "No relevant past conversations."
+        
+        chat_prompt = (
+            "You are NextRole AI, a highly intelligent and helpful career assistant. "
+            "You have access to the user's email history and past conversations. "
+            "The user is chatting with you on Telegram. Speak naturally and helpfully.\n\n"
+            f"User Message: {text}\n\n"
+            f"--- RELEVANT EMAIL CONTEXT ---\n{email_context}\n\n"
+            f"--- PAST CONVERSATION CONTEXT ---\n{chat_context}\n\n"
+            "INSTRUCTIONS:\n"
+            "1. Use the email context if they ask about jobs, status, or dates.\n"
+            "2. Use the past conversation context to maintain continuity if they refer to previous topics.\n"
+            "3. If neither context is relevant, be a friendly career coach."
         )
+        
+        # Use lite model for general chat
+        chat_response = await self.ai.generate_text(chat_prompt, model_type="lite")
+        
+        # 3. Record Bot Response in Chat Memory
+        chroma.add_chat_message(user_id=user.id, text=chat_response, role="bot")
+        
+        await self._send_telegram(chat_id, chat_response)
 

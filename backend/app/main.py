@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -9,6 +10,9 @@ from app.core.db import engine
 from app.memory.relational.repository import init_db
 from app.scheduler.digests import start_scheduler
 
+# Configure Logging
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(message)s")
+logger = logging.getLogger(__name__)
 
 def create_app() -> FastAPI:
     app = FastAPI(title="NextRole AI")
@@ -38,4 +42,3 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
-
