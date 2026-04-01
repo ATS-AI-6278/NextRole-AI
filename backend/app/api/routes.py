@@ -7,7 +7,13 @@ from sqlalchemy.orm import Session
 
 from app.core.db import get_db
 from app.gmail.client import GmailClient, encrypt_secret
-from app.memory.relational.repository import get_or_create_gmail_account, get_or_create_user_by_chat_id, list_job_applications
+from app.memory.relational.repository import (
+    get_or_create_gmail_account, 
+    get_or_create_user_by_chat_id, 
+    list_job_applications,
+    get_job_stats,
+    get_active_scan_task,
+)
 from app.memory.relational.models import GmailAccount, User
 from app.agents.privacy_agent import IngestionPipeline
 from app.memory.vector.chroma_client import ChromaClient
@@ -84,6 +90,33 @@ def dashboard_applications(
         }
         for j in jobs
     ]
+
+
+@router.get("/dashboard/scan-status")
+def dashboard_scan_status(
+    x_telegram_chat_id: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    user = get_or_create_user_by_chat_id(db, x_telegram_chat_id)
+    task = get_active_scan_task(db, user.id)
+    if not task:
+        return {"status": "none"}
+    return {
+        "id": task.id,
+        "status": task.status,
+        "processed_count": task.processed_count,
+        "scan_limit": task.scan_limit,
+        "updated_at": task.updated_at.isoformat() if task.updated_at else None,
+    }
+
+
+@router.get("/dashboard/stats")
+def dashboard_stats(
+    x_telegram_chat_id: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    user = get_or_create_user_by_chat_id(db, x_telegram_chat_id)
+    return get_job_stats(db, user.id)
 
 
 class DevIngestRequest(BaseModel):

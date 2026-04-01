@@ -26,3 +26,27 @@ export async function getApplications(chatId: string): Promise<JobApplication[]>
   return (await res.json()) as JobApplication[];
 }
 
+export type ScanStatus = {
+  id: number;
+  status: string;
+  processed_count: number;
+  scan_limit: number;
+  updated_at: string | null;
+};
+
+export async function getScanStatus(chatId: string): Promise<ScanStatus> {
+  const res = await fetch(`${backendBase}/dashboard/scan-status`, {
+    headers: { "x-telegram-chat-id": chatId },
+  });
+  return (await res.json()) as ScanStatus;
+}
+
+export type JobStats = Record<string, number>;
+
+export async function getStats(chatId: string): Promise<JobStats> {
+  const res = await fetch(`${backendBase}/dashboard/stats`, {
+    headers: { "x-telegram-chat-id": chatId },
+  });
+  return (await res.json()) as JobStats;
+}
+

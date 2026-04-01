@@ -103,6 +103,22 @@ def list_job_applications(db: Session, user_id: int, limit: int = 200) -> List[J
     return list(db.execute(stmt).scalars().all())
 
 
+def get_job_stats(db: Session, user_id: int) -> Dict[str, int]:
+    from sqlalchemy import func
+    stmt = (
+        select(JobApplication.status, func.count(JobApplication.id))
+        .where(JobApplication.user_id == user_id)
+        .group_by(JobApplication.status)
+    )
+    results = db.execute(stmt).all()
+    stats = {status: count for status, count in results}
+    # Ensure common statuses exist
+    for s in ["Applied", "Interviewing", "Offer", "Rejected", "Ghosted"]:
+        if s not in stats:
+            stats[s] = 0
+    return stats
+
+
 def update_job_status(db: Session, job_id: int, new_status: str, *, source_message_id: Optional[str] = None, last_status_at: Optional[dt.datetime] = None) -> JobApplication:
     job = db.execute(select(JobApplication).where(JobApplication.id == job_id)).scalars().first()
     # If not found, create logic can be added later; for now we fail clearly.
@@ -218,3 +234,13 @@ def complete_scan_task(db: Session, task_id: int) -> None:
 def fail_scan_task(db: Session, task_id: int) -> None:
     db.execute(update(ScanTask).where(ScanTask.id == task_id).values(status="failed"))
     db.commit()
+
+
+def get_active_scan_task(db: Session, user_id: int) -> Optional[ScanTask]:
+    stmt = (
+        select(ScanTask)
+        .where(ScanTask.user_id == user_id)
+        .order_by(ScanTask.created_at.desc())
+        .limit(1)
+    )
+    return db.execute(stmt).scalars().first()
