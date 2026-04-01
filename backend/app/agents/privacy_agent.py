@@ -131,12 +131,12 @@ class IngestionPipeline:
         
         observations = {"spam": [], "newsletter": [], "marketing": []}
 
-        # CHUNK INTO BATCHES OF 10 (Respects 15 RPM limit)
-        for b_idx in range(0, len(new_messages), 10):
+        # CHUNK INTO BATCHES OF 2 (Ultra-Conservative for 15k TPM)
+        for b_idx in range(0, len(new_messages), 2):
             # Progress Update: Only print ONCE per batch!
             await send_telegram_message(telegram_chat_id, f"⚙️ Batch Analysis: {processed}/{total_new} complete...")
 
-            batch = new_messages[b_idx : b_idx + 10]
+            batch = new_messages[b_idx : b_idx + 2]
             batch_data = []
             
             # 1. Fetch metadata for all in batch
@@ -151,7 +151,7 @@ class IngestionPipeline:
                         "subject": gmail_message.subject,
                         "from": gmail_message.from_address,
                         "date": gmail_message.date,
-                        "body": gmail_message.body_text[:600],  # Compressed snippet for Gemma TPM Limits
+                        "body": gmail_message.body_text[:500],  # Compressed snippet for Gemma TPM Limits
                         "full_body": gmail_message.body_text,   # Full body for memory recall
                     })
                 except Exception as e:
@@ -161,14 +161,31 @@ class IngestionPipeline:
             if not batch_data:
                 continue
 
-            # 2. Super-Analysis LLM Call
+            # 2. Super-Analysis LLM Call (Hyper-Intelligent Mode)
             prompt = (
-                "Perform Deep Analysis on these emails. For each email, provide:\n"
-                "1. secrets: List of passwords or OTP codes found (type/value).\n"
-                "2. classification: {label, apply_labels, add_label_names, remove_label_names}.\n"
-                "3. career_info: {company, role, status, is_job_related}.\n\n"
-                "Return a JSON list of objects, one per email, with 'id' matching the input.\n\n"
-                f"Emails:\n{json.dumps(batch_data, indent=2)}"
+                "Perform an Ultra-Deep Analysis on the following batch of emails. "
+                "Your goal is to extract actionable career data while ensuring zero-leakage of transient secrets.\n\n"
+                "For each email, return a JSON object with:\n"
+                "1. 'id': The message ID.\n"
+                "2. 'secrets': A list of sensitive items (e.g., {'type': 'OTP|Password|RecoveryCode', 'value': '...'}). "
+                "Focus ONLY on temporary credentials, NOT login names or tracking IDs.\n"
+                "3. 'classification': {\n"
+                "     'label': 'Job_Applied|Job_Interview|Job_Offer|Job_Rejection|Newsletter|Marketing|Spam|Personal',\n"
+                "     'apply_labels': true,\n"
+                "     'add_label_names': ['NextRole/Career' if job-related, else category],\n"
+                "     'remove_label_names': []\n"
+                "   }\n"
+                "4. 'career_info': {\n"
+                "     'company': 'Clean Company Name',\n"
+                "     'role': 'Job title or 'Position'',\n"
+                "     'status': 'Applied|Interview|Offer|Rejected',\n"
+                "     'is_job_related': bool\n"
+                "   }\n\n"
+                "RULES:\n"
+                "- If the email is an interview request or scheduling link, set status to 'Interview'.\n"
+                "- If it mentions 'not moving forward' or 'other candidates', set status to 'Rejected'.\n"
+                "- If it's a multi-job digest from LinkedIn/Indeed, label as 'Newsletter'.\n\n"
+                f"Batch Emails (JSON):\n{json.dumps(batch_data, indent=2)}"
             )
             # Use Gemma for the complex batch task (preserves rate limits)
             ai_results = await self.ai.generate_json(prompt, model_type="gemma")
@@ -254,9 +271,8 @@ class IngestionPipeline:
             if scan_task_id:
                 update_scan_progress(db, scan_task_id, processed, batch_data[-1]["id"])
 
-            # Pacing to avoid hitting 15K TPM limits on Gemma
-            if (b_idx + 10) < total_new:
-                await asyncio.sleep(8)
+            # Gemma-aware pacing is now handled automatically by AIClient
+            pass
 
         if scan_task_id:
             if failed == 0:
